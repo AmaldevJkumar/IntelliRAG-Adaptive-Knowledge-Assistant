@@ -1,0 +1,375 @@
+name: Continuous Integration
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  PYTHON_VERSION: '3.11'
+  NODE_VERSION: '18'
+
+jobs:
+  # Code Quality and Security
+  code-quality:
+    runs-on: ubuntu-latest
+    name: Code Quality & Security
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+        
+    - name: Cache Python dependencies
+      uses: actions/cache@v3
+      with:
+        path: ~/.cache/pip
+        key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+        
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install flake8 black isort mypy bandit safety
+        pip install -r requirements.txt
+        
+    - name: Code formatting check (Black)
+      run: black --check --diff backend/
+      
+    - name: Import sorting check (isort)
+      run: isort --check-only --diff backend/
+      
+    - name: Linting (flake8)
+      run: flake8 backend/ --count --select=E9,F63,F7,F82 --show-source --statistics
+      
+    - name: Type checking (mypy)
+      run: mypy backend/app --ignore-missing-imports
+      continue-on-error: true
+      
+    - name: Security scan (bandit)
+      run: bandit -r backend/ -f json -o bandit-report.json
+      continue-on-error: true
+      
+    - name: Dependency vulnerability check
+      run: safety check --json --output safety-report.json
+      continue-on-error: true
+      
+    - name: Upload security reports
+      uses: actions/upload-artifact@v3
+      if: always()
+      with:
+        name: security-reports
+        path: |
+          bandit-report.json
+          safety-report.json
+
+  # Unit and Integration Tests
+  test:
+    runs-on: ubuntu-latest
+    name: Tests
+    
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_PASSWORD: test_password
+          POSTGRES_USER: test_user
+          POSTGRES_DB: test_db
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+          
+      redis:
+        image: redis:7-alpine
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 6379:6379
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+        
+    - name: Cache Python dependencies
+      uses: actions/cache@v3
+      with:
+        path: ~/.cache/pip
+        key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+        
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        pip install pytest pytest-asyncio pytest-cov
+        python -m spacy download en_core_web_sm
+        
+    - name: Create test environment
+      run: |
+        mkdir -p logs data/faiss_index data/temp
+        
+    - name: Set environment variables
+      run: |
+        echo "DATABASE_URL=postgresql://test_user:test_password@localhost:5432/test_db" >> $GITHUB_ENV
+        echo "REDIS_URL=redis://localhost:6379/1" >> $GITHUB_ENV
+        echo "ENVIRONMENT=testing" >> $GITHUB_ENV
+        echo "OPENAI_API_KEY=test-key" >> $GITHUB_ENV
+        echo "VECTOR_DB_TYPE=mock" >> $GITHUB_ENV
+        echo "ENABLE_METRICS=false" >> $GITHUB_ENV
+        echo "ENABLE_MLFLOW=false" >> $GITHUB_ENV
+        
+    - name: Run unit tests
+      run: |
+        cd backend
+        python -m pytest ../tests/ -v --cov=app --cov-report=xml --cov-report=html --cov-report=term-missing
+        
+    - name: Upload coverage reports
+      uses: codecov/codecov-action@v3
+      with:
+        files: ./backend/coverage.xml
+        fail_ci_if_error: false
+        
+    - name: Upload test artifacts
+      uses: actions/upload-artifact@v3
+      if: always()
+      with:
+        name: test-results
+        path: |
+          backend/htmlcov/
+          backend/coverage.xml
+
+  # Build and Test Docker Image
+  docker-build:
+    runs-on: ubuntu-latest
+    name: Docker Build & Test
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+      
+    - name: Build Docker image
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        file: ./Dockerfile
+        tags: rag-knowledge-assistant:test
+        load: true
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+        
+    - name: Test Docker image
+      run: |
+        # Start container in background
+        docker run -d --name rag-test \
+          -p 8000:8000 \
+          -e OPENAI_API_KEY=test-key \
+          -e VECTOR_DB_TYPE=mock \
+          -e DATABASE_URL=sqlite:///./test.db \
+          rag-knowledge-assistant:test
+          
+        # Wait for container to start
+        sleep 30
+        
+        # Health check
+        curl -f http://localhost:8000/health || exit 1
+        
+        # API test
+        curl -f -X POST http://localhost:8000/api/v1/query \
+          -H "Content-Type: application/json" \
+          -d '{"query": "What is machine learning?"}' || exit 1
+          
+        # Cleanup
+        docker stop rag-test
+        docker rm rag-test
+
+  # API Integration Tests
+  api-tests:
+    runs-on: ubuntu-latest
+    name: API Integration Tests
+    needs: [docker-build]
+    
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_PASSWORD: test_password
+          POSTGRES_USER: test_user
+          POSTGRES_DB: test_db
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+          
+      redis:
+        image: redis:7-alpine
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 6379:6379
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+        
+    - name: Install test dependencies
+      run: |
+        pip install requests pytest pytest-asyncio httpx
+        
+    - name: Start RAG service
+      run: |
+        cd backend
+        python -m pip install -r ../requirements.txt
+        python -m spacy download en_core_web_sm
+        
+        export DATABASE_URL=postgresql://test_user:test_password@localhost:5432/test_db
+        export REDIS_URL=redis://localhost:6379/1
+        export OPENAI_API_KEY=test-key
+        export VECTOR_DB_TYPE=mock
+        export ENABLE_METRICS=false
+        
+        python -m uvicorn app.main:app --host 0.0.0.0 --port 8000 &
+        
+        # Wait for service to start
+        sleep 30
+        
+    - name: Run API integration tests
+      run: |
+        python -m pytest tests/test_api.py -v --tb=short
+        
+    - name: Run load tests
+      run: |
+        # Simple load test
+        for i in {1..10}; do
+          curl -s -X POST http://localhost:8000/api/v1/query \
+            -H "Content-Type: application/json" \
+            -d "{\"query\": \"Test query $i\"}" > /dev/null &
+        done
+        wait
+        echo "Load test completed"
+
+  # Security Scanning
+  security-scan:
+    runs-on: ubuntu-latest
+    name: Security Scan
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Run Trivy vulnerability scanner
+      uses: aquasecurity/trivy-action@master
+      with:
+        scan-type: 'fs'
+        scan-ref: '.'
+        format: 'sarif'
+        output: 'trivy-results.sarif'
+        
+    - name: Upload Trivy scan results
+      uses: github/codeql-action/upload-sarif@v2
+      if: always()
+      with:
+        sarif_file: 'trivy-results.sarif'
+
+  # Documentation Build
+  docs-build:
+    runs-on: ubuntu-latest
+    name: Documentation Build
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+        
+    - name: Install documentation dependencies
+      run: |
+        pip install mkdocs mkdocs-material mkdocs-mermaid2-plugin
+        
+    - name: Build documentation
+      run: |
+        # Create basic mkdocs.yml if it doesn't exist
+        if [ ! -f mkdocs.yml ]; then
+          cat > mkdocs.yml << EOF
+        site_name: RAG Knowledge Assistant
+        theme:
+          name: material
+          palette:
+            primary: blue
+            accent: light blue
+        nav:
+          - Home: README.md
+          - API Documentation: docs/API.md
+          - Deployment: docs/DEPLOYMENT.md
+          - Configuration: docs/CONFIGURATION.md
+          - Evaluation: docs/EVALUATION.md
+        EOF
+        fi
+        
+        mkdocs build --strict
+        
+    - name: Upload documentation
+      uses: actions/upload-artifact@v3
+      with:
+        name: documentation
+        path: site/
+
+  # Results Summary
+  ci-summary:
+    runs-on: ubuntu-latest
+    name: CI Summary
+    needs: [code-quality, test, docker-build, api-tests, security-scan, docs-build]
+    if: always()
+    
+    steps:
+    - name: CI Results Summary
+      run: |
+        echo "# CI Pipeline Results" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "## Job Status" >> $GITHUB_STEP_SUMMARY
+        echo "- Code Quality: ${{ needs.code-quality.result }}" >> $GITHUB_STEP_SUMMARY
+        echo "- Tests: ${{ needs.test.result }}" >> $GITHUB_STEP_SUMMARY
+        echo "- Docker Build: ${{ needs.docker-build.result }}" >> $GITHUB_STEP_SUMMARY
+        echo "- API Tests: ${{ needs.api-tests.result }}" >> $GITHUB_STEP_SUMMARY
+        echo "- Security Scan: ${{ needs.security-scan.result }}" >> $GITHUB_STEP_SUMMARY
+        echo "- Documentation: ${{ needs.docs-build.result }}" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        
+        if [[ "${{ needs.code-quality.result }}" == "success" && 
+              "${{ needs.test.result }}" == "success" && 
+              "${{ needs.docker-build.result }}" == "success" ]]; then
+          echo "✅ **All critical checks passed!**" >> $GITHUB_STEP_SUMMARY
+        else
+          echo "❌ **Some critical checks failed**" >> $GITHUB_STEP_SUMMARY
+        fi
